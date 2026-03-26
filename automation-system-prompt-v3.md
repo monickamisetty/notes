@@ -28,14 +28,15 @@ This document is your complete specification. Read it fully before doing anythin
 8. [Git Operations Module — Rules & Guardrails](#8-git-operations-module--rules--guardrails)
 9. [AI-Driven Change Logic — Per Playbook Type](#9-ai-driven-change-logic--per-playbook-type)
 10. [MR Configuration Hierarchy](#10-mr-configuration-hierarchy)
-11. [Reporting & Logging](#11-reporting--logging)
-12. [Safety Guardrails & Restrictions](#12-safety-guardrails--restrictions)
-13. [How To Run — Interactive & Batch Modes](#13-how-to-run--interactive--batch-modes)
-14. [Example Walkthroughs — End to End](#14-example-walkthroughs--end-to-end)
-15. [Appendix A — Target Project Structure](#appendix-a--target-project-structure)
-16. [Appendix B — Example MR Diffs](#appendix-b--example-mr-diffs)
-17. [Appendix C — Twistlock Report Parsing Guide](#appendix-c--twistlock-report-parsing-guide)
-18. [Appendix D — Gradle Dependency Tree Analysis Guide](#appendix-d--gradle-dependency-tree-analysis-guide)
+11. [Quality & Consistency — Batch Execution Strategy](#11-quality--consistency--batch-execution-strategy)
+12. [Reporting & Logging](#12-reporting--logging)
+13. [Safety Guardrails & Restrictions](#13-safety-guardrails--restrictions)
+14. [How To Run — Interactive & Batch Modes](#14-how-to-run--interactive--batch-modes)
+15. [Example Walkthroughs — End to End](#15-example-walkthroughs--end-to-end)
+16. [Appendix A — Target Project Structure](#appendix-a--target-project-structure)
+17. [Appendix B — Example MR Diffs](#appendix-b--example-mr-diffs)
+18. [Appendix C — Twistlock Report Parsing Guide](#appendix-c--twistlock-report-parsing-guide)
+19. [Appendix D — Gradle Dependency Tree Analysis Guide](#appendix-d--gradle-dependency-tree-analysis-guide)
 
 ---
 
@@ -648,6 +649,21 @@ fix_strategy:
   allow_force_resolution: true
   deduplicate_across_projects: true
 
+# Batch execution settings
+batch:
+  size: 5
+
+# Reference MR — a verified correct example of this type of change.
+# Paste an actual MR diff from a previous manual change.
+# The AI will match this pattern for every project.
+reference_mr: |
+  [PASTE A VERIFIED MR DIFF HERE — from a previous manual vulnerability fix]
+  
+  Example:
+  diff --git a/build.gradle b/build.gradle
+  -    implementation 'org.apache.logging.log4j:log4j-core:2.17.0'
+  +    implementation 'org.apache.logging.log4j:log4j-core:2.17.1'
+
 # Task-level MR defaults (override config defaults, overridden by project-level)
 create_mr: true
 mr_target_branch: "master"
@@ -1148,7 +1164,319 @@ Then: final = "main" (project-level in task wins, priority 1)
 
 ---
 
-## 11. Reporting & Logging
+## 11. Quality & Consistency — Batch Execution Strategy
+
+### The problem: context degradation
+
+When processing 50+ projects in a single AI session, quality degrades as the conversation grows. By project 20, the AI's context is polluted with analysis, diffs, and logs from projects 1-19. The model may confuse one project's structure with another, copy patterns that don't apply, or lose focus on the playbook instructions buried under thousands of lines of prior output.
+
+### The solution: batched execution with stateless project prompts
+
+The system uses three techniques together to maintain consistent quality:
+
+1. **Batched execution** — process 5-10 projects per Copilot session, then start a fresh session
+2. **Stateless project prompts** — each project gets a complete, self-contained prompt within the session
+3. **Reference MR anchoring** — every project's prompt includes a user-provided reference MR diff
+
+### 11.1 Batch execution model
+
+```
+Total projects: 50
+
+Batch 1 (fresh Copilot session):
+  Projects 1-10 → process sequentially → generate batch report
+
+  [User starts a new Copilot session — no review needed, just a fresh chat]
+
+Batch 2 (fresh Copilot session):
+  Projects 11-20 → process sequentially → generate batch report
+
+  [New session]
+
+Batch 3-5: same pattern
+
+After all batches: merge all batch reports into final summary
+```
+
+The orchestrator script manages batching:
+- It splits the project list into batches of N (configurable, default 5)
+- For each batch, it generates a self-contained batch prompt file
+- After each batch, it saves progress to `logs/{task}_progress.json`
+- When you start a new session, you run the same command — it picks up where it left off
+
+### 11.2 Progress tracking
+
+The script maintains a progress file so it knows which projects are done:
+
+```
+logs/{task_name}_progress.json
+```
+
+```json
+{
+  "task": "vuln-fix-SEC-1234",
+  "total_projects": 50,
+  "batch_size": 5,
+  "completed": [
+    { "name": "api-gateway", "status": "success", "batch": 1 },
+    { "name": "user-service", "status": "success", "batch": 1 },
+    { "name": "payment-service", "status": "failed", "batch": 1 },
+    { "name": "notification-service", "status": "success", "batch": 1 },
+    { "name": "kafka-consumer", "status": "success", "batch": 1 }
+  ],
+  "pending": [
+    "order-service", "inventory-service", "auth-service", "..."
+  ],
+  "current_batch": 2
+}
+```
+
+When you run the orchestrator again in a new session:
+- It reads the progress file
+- Skips completed projects
+- Processes the next batch of pending projects
+- Updates the progress file
+
+```bash
+# First session — processes batch 1 (projects 1-5)
+node scripts/orchestrator.js --task tasks/vuln-fix-SEC-1234.yaml
+
+# Start new Copilot session, run same command — processes batch 2 (projects 6-10)
+node scripts/orchestrator.js --task tasks/vuln-fix-SEC-1234.yaml
+
+# Continue until all batches are done
+```
+
+### 11.3 Stateless project prompts
+
+Within a single batch session, each project gets a **self-contained prompt** that does NOT depend on any context from previous projects. The AI should treat each project as if it is the first and only project.
+
+The orchestrator generates this prompt for each project and presents it to the AI:
+
+```
+=== PROJECT TASK: {project_name} ===
+
+PLAYBOOK: {playbook name and full instructions — copied fresh, not referenced}
+
+TASK PARAMETERS:
+{full task parameters — copied fresh}
+
+REFERENCE MR:
+{the user-provided reference MR diff — copied fresh}
+
+PROJECT REPO PATH: workspace/{project_name}/
+
+INSTRUCTIONS:
+1. Read the project files at the repo path above
+2. Follow the playbook phases exactly
+3. Your output must match the pattern shown in the REFERENCE MR
+4. Before making any edits, output your CHANGE PLAN (see below)
+5. After making edits, output your VERIFICATION REPORT (see below)
+
+=== END PROJECT TASK ===
+```
+
+**CRITICAL**: The playbook instructions and reference MR are included IN FULL in every project prompt, not just "see above" or "same as before." This ensures the AI has all the information it needs even if earlier context has scrolled out of the attention window.
+
+### 11.4 Reference MR anchoring
+
+The user provides a reference MR diff in the task instance YAML. This is a real, verified MR from a previous manual change — not AI-generated.
+
+In the task instance file:
+
+```yaml
+# Reference MR — a verified correct example of this type of change.
+# The AI must match this pattern for every project.
+reference_mr: |
+  Project: api-gateway
+  
+  diff --git a/build.gradle b/build.gradle
+  -    implementation 'org.apache.logging.log4j:log4j-core:2.17.0'
+  +    implementation 'org.apache.logging.log4j:log4j-core:2.17.1'
+  
+  This MR shows the correct pattern:
+  - Only the version string changed
+  - No reformatting
+  - No other dependencies modified
+  - Commit message follows convention
+```
+
+The AI uses this reference to:
+- Understand exactly what a correct change looks like
+- Match the style (formatting, indentation, comment preservation)
+- Validate its own output against the reference pattern
+- Catch drift ("my change adds 15 new lines but the reference only changed 1 line — something is wrong")
+
+### 11.5 Structured checkpoints
+
+Before making any edits, the AI must output a structured **CHANGE PLAN**. After making edits, the AI must output a structured **VERIFICATION REPORT**. These serve as quality checkpoints.
+
+#### CHANGE PLAN (output before editing)
+
+The AI outputs this BEFORE touching any file:
+
+```
+=== CHANGE PLAN for {project_name} ===
+
+Task type: {playbook name}
+Files to modify:
+  1. {file path} — {what will change}
+  2. {file path} — {what will change}
+
+Changes:
+  1. File: build.gradle
+     Line: 25
+     Current: implementation 'org.apache.logging.log4j:log4j-core:2.17.0'
+     New:     implementation 'org.apache.logging.log4j:log4j-core:2.17.1'
+     Reason: Direct dependency bump to fix CVE-2026-22334
+  
+  2. File: build.gradle
+     Line: 20
+     Current: implementation 'org.springframework.boot:spring-boot-starter-webflux:3.2.1'
+     New:     implementation 'org.springframework.boot:spring-boot-starter-webflux:3.2.5'
+     Reason: Parent bump resolves CVE-2026-31001, CVE-2026-31002, CVE-2026-44556
+
+Consistency check vs reference MR:
+  - Reference changed 1 file (build.gradle) ✓ I am changing 1 file
+  - Reference only changed version strings ✓ I am only changing version strings
+  - Reference preserved formatting ✓ I will preserve formatting
+
+Risk assessment: LOW — standard version bumps, no structural changes
+
+=== END CHANGE PLAN ===
+```
+
+The AI should review its own plan for consistency with the reference MR before proceeding. If the plan diverges significantly from the reference pattern (e.g., changing 5 files when the reference changed 1), the AI should flag this as a WARNING and explain why.
+
+#### VERIFICATION REPORT (output after editing)
+
+The AI outputs this AFTER making all edits:
+
+```
+=== VERIFICATION REPORT for {project_name} ===
+
+Files modified: ["build.gradle"]
+Files expected: ["build.gradle"]
+Match: ✓
+
+Changes applied:
+  1. ✓ log4j-core 2.17.0 → 2.17.1
+  2. ✓ spring-boot-starter-webflux 3.2.1 → 3.2.5
+
+Verification steps completed:
+  - ✓ ./gradlew dependencies shows fixed versions
+  - ✓ ./gradlew build --dry-run passed
+  - ✓ git diff shows only expected changes
+  - ✓ No unexpected files modified
+
+Consistency with reference MR:
+  - ✓ Same file(s) modified
+  - ✓ Same type of changes (version strings only)
+  - ✓ Formatting preserved
+
+Warnings: none
+Errors: none
+
+Status: READY TO COMMIT
+
+=== END VERIFICATION REPORT ===
+```
+
+### 11.6 Self-verification rules
+
+After making edits, the AI MUST perform these self-checks before reporting success:
+
+```
+1. FILE COUNT CHECK
+   Count the files in git diff --name-only
+   Compare to the reference MR's file count
+   If significantly different (e.g., reference changed 1 file, you changed 5):
+     → Flag WARNING, explain why
+
+2. CHANGE TYPE CHECK
+   Categorize each change: version bump, config value change, new content addition
+   Compare to the reference MR's change types
+   If the type is different: → Flag WARNING
+
+3. DIFF SIZE CHECK
+   Count lines added/removed in git diff --stat
+   Compare to the reference MR's approximate diff size
+   If your diff is 5x larger than the reference: → Flag WARNING
+   (Some variation is expected — projects differ — but order-of-magnitude differences indicate a problem)
+
+4. FORMAT PRESERVATION CHECK
+   For each modified file, verify:
+   - Indentation is consistent with the original
+   - No trailing whitespace added
+   - No extra blank lines added
+   - Comments preserved
+   - YAML files are still valid (parse test)
+
+5. SCOPE CHECK
+   Verify NO changes were made outside the playbook's allowed file list
+   If unexpected files appear: → REVERT ALL, report ERROR
+
+6. CONTENT SANITY CHECK
+   For vulnerability fixes: do the new version numbers actually exist?
+     (e.g., don't bump to spring-boot 99.99.99)
+   For config updates: is the new value format-compatible with the old value?
+     (e.g., don't replace a URL with a number)
+   For version bumps: are all version references consistent?
+     (e.g., don't have 1.3.0 in gradle.properties but 1.2.3 in Chart.yaml)
+```
+
+### 11.7 Batch configuration
+
+In the task instance YAML:
+
+```yaml
+# Batch execution settings
+batch:
+  size: 5                          # Projects per Copilot session
+  progress_file: "auto"            # "auto" = logs/{task_name}_progress.json
+```
+
+Or override via CLI:
+
+```bash
+# Process in batches of 8
+node scripts/orchestrator.js --task tasks/your-task.yaml --batch-size 8
+
+# Force re-process a specific project that failed
+node scripts/orchestrator.js --task tasks/your-task.yaml --project api-gateway --force
+```
+
+### 11.8 Between-batch workflow
+
+This is the ONLY human interaction required during execution:
+
+```
+1. Run the orchestrator — it processes batch 1 (5 projects), then STOPS
+2. The script prints: "Batch 1 complete. 5/50 projects done.
+   Start a new Copilot session and run the same command to continue."
+3. You start a new Copilot chat
+4. You paste/load the system prompt (this document) in the new chat
+5. You run the same command — it picks up batch 2 automatically
+6. Repeat until all batches are done
+```
+
+You are NOT reviewing changes between batches. You are NOT approving anything. You are simply starting a fresh Copilot session so the AI gets a clean context. This is a mechanical action, not a decision.
+
+### 11.9 Summary: how quality is maintained
+
+| Technique | What it prevents |
+|-----------|-----------------|
+| Batching (5-10 per session) | Context window pollution — each batch starts fresh |
+| Stateless project prompts | Cross-project contamination — each project is self-contained |
+| Reference MR anchoring | Style drift — the AI has a verified example to match |
+| Change plan checkpoint | Bad edits — the AI reviews its own plan before executing |
+| Verification report | Undetected errors — structured self-check after every project |
+| Self-verification rules | Subtle bugs — format, scope, and sanity checks |
+| Progress tracking | Lost work — resume after session breaks without re-processing |
+
+---
+
+## 12. Reporting & Logging
 
 ### Log files per execution
 
@@ -1198,7 +1526,7 @@ Then: final = "main" (project-level in task wins, priority 1)
 
 ---
 
-## 12. Safety Guardrails & Restrictions
+## 13. Safety Guardrails & Restrictions
 
 ```
 1. GIT SAFETY (Section 8)
@@ -1242,7 +1570,7 @@ Then: final = "main" (project-level in task wins, priority 1)
 
 ---
 
-## 13. How To Run — Interactive & Batch Modes
+## 14. How To Run — Interactive & Batch Modes
 
 ### First-time setup
 
@@ -1251,7 +1579,7 @@ cd ~/automation-workspace
 npm install
 ```
 
-### Interactive mode (testing)
+### Interactive mode (testing with a single project)
 
 ```bash
 # Dry run on one project
@@ -1268,22 +1596,37 @@ node scripts/orchestrator.js \
   --verbose
 ```
 
-### Batch mode
+### Batch mode (full execution across all projects)
 
 ```bash
-# Dry run first — always
-node scripts/orchestrator.js --task tasks/your-task.yaml --dry-run
+# Step 1: Dry run the first batch to verify
+node scripts/orchestrator.js --task tasks/your-task.yaml --dry-run --batch-size 5
 
-# Full run
-node scripts/orchestrator.js --task tasks/your-task.yaml
+# Step 2: Run batch 1 for real
+node scripts/orchestrator.js --task tasks/your-task.yaml --batch-size 5
+# → Processes projects 1-5, saves progress, stops
 
-# Check results
+# Step 3: Start a new Copilot session (fresh context)
+
+# Step 4: Run the same command — it picks up batch 2 automatically
+node scripts/orchestrator.js --task tasks/your-task.yaml --batch-size 5
+# → Processes projects 6-10, saves progress, stops
+
+# Step 5: Repeat until all projects are done
+
+# Check overall progress at any time
+cat logs/your-task_progress.json
+
+# Force re-process a failed project
+node scripts/orchestrator.js --task tasks/your-task.yaml --project payment-service --force
+
+# Check final summary (merged from all batches)
 cat logs/your-task_*_summary.md
 ```
 
 ---
 
-## 14. Example Walkthroughs — End to End
+## 15. Example Walkthroughs — End to End
 
 ### 14.1 Vulnerability fix walkthrough
 
@@ -1568,8 +1911,9 @@ When you (the AI assistant in Copilot) receive this document:
 7. [ ] Implement the orchestrator in JavaScript (Section 7):
        - git-ops.js with all guardrails (Section 8)
        - gitlab-api.js for MR creation
-       - reporter.js for logging
+       - reporter.js for logging and progress tracking
        - orchestrator.js as main entry with MR config hierarchy (Section 10)
+         and batch execution support (Section 11)
 8. [ ] Test with a simple task using `--dry-run --project {one_project} --verbose`
 9. [ ] Wait for user approval before any real execution
 10. [ ] For ALL task types: the AI reads, analyzes, and edits files. The script only does git.
@@ -1583,3 +1927,7 @@ When you (the AI assistant in Copilot) receive this document:
 - Partial fixes are acceptable.
 - The script is task-type-agnostic. The AI is the change engine.
 - MR target branch follows the hierarchy: project-in-task > task-default > project-in-config > global-default.
+- Process projects in batches of 5-10 per Copilot session for consistent quality.
+- Every project gets a self-contained prompt with the reference MR included.
+- Always output a CHANGE PLAN before editing and a VERIFICATION REPORT after.
+- Compare your changes against the reference MR pattern for every project.
